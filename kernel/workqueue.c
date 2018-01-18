@@ -4850,7 +4850,7 @@ void freeze_workqueues_begin(void)
  * %true if some freezable workqueues are still busy.  %false if freezing
  * is complete.
  */
-bool freeze_workqueues_busy(void)
+bool freeze_workqueues_busy(char **busy_wq_name)
 {
 	bool busy = false;
 	struct workqueue_struct *wq;
@@ -4872,6 +4872,7 @@ bool freeze_workqueues_busy(void)
 			WARN_ON_ONCE(pwq->nr_active < 0);
 			if (pwq->nr_active) {
 				busy = true;
+				*busy_wq_name = wq->name;
 				rcu_read_unlock_sched();
 				goto out_unlock;
 			}

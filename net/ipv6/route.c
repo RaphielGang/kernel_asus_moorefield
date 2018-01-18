@@ -94,8 +94,9 @@ static void		rt6_do_redirect(struct dst_entry *dst, struct sock *sk,
 
 #ifdef CONFIG_IPV6_ROUTE_INFO
 static struct rt6_info *rt6_add_route_info(struct net_device *dev,
-					   const struct in6_addr *prefix, int prefixlen,
-					   const struct in6_addr *gwaddr, unsigned int pref);
+				const struct in6_addr *prefix, int prefixlen,
+				const struct in6_addr *gwaddr,
+				unsigned int pref);
 static struct rt6_info *rt6_get_route_info(struct net_device *dev,
 					   const struct in6_addr *prefix, int prefixlen,
 					   const struct in6_addr *gwaddr);
@@ -1881,7 +1882,8 @@ out:
 
 static struct rt6_info *rt6_add_route_info(struct net_device *dev,
 					   const struct in6_addr *prefix, int prefixlen,
-					   const struct in6_addr *gwaddr, unsigned int pref)
+					   const struct in6_addr *gwaddr,
+					   unsigned int pref)
 {
 	struct fib6_config cfg = {
 		.fc_table	= addrconf_rt_table(dev, RT6_TABLE_INFO),
@@ -1954,7 +1956,8 @@ struct rt6_info *rt6_add_dflt_router(const struct in6_addr *gwaddr,
 }
 
 
-int rt6_addrconf_purge(struct rt6_info *rt, void *arg) {
+int rt6_addrconf_purge(struct rt6_info *rt, void *arg)
+{
 	if (rt->rt6i_flags & (RTF_DEFAULT | RTF_ADDRCONF) &&
 	    (!rt->rt6i_idev || rt->rt6i_idev->cnf.accept_ra != 2))
 		return -1;

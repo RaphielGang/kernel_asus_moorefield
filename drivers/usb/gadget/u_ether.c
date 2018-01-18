@@ -98,6 +98,12 @@ static unsigned qmult = 10;
 module_param(qmult, uint, S_IRUGO|S_IWUSR);
 MODULE_PARM_DESC(qmult, "queue length multiplier at high/super speed");
 
+/* Add padding space before the NET_IP_ALIGN to ensure the address of data
+ * buffer align on 64B
+ */
+#define DMA_ALIGN_64    64
+#define DMA_IP_ALIGN_PAD   (DMA_ALIGN_64 - NET_IP_ALIGN)
+
 /* for dual-speed hardware, use deeper queues at high/super speed */
 static inline int qlen(struct usb_gadget *gadget)
 {
@@ -233,8 +239,6 @@ rx_submit(struct eth_dev *dev, struct usb_request *req, gfp_t gfp_flags)
 	 */
 	size += sizeof(struct ethhdr) + dev->net->mtu + RX_EXTRA;
 	size += dev->port_usb->header_len;
-	size += out->maxpacket - 1;
-	size -= size % out->maxpacket;
 
 	if (dev->ul_max_pkts_per_xfer)
 		size *= dev->ul_max_pkts_per_xfer;
@@ -242,8 +246,7 @@ rx_submit(struct eth_dev *dev, struct usb_request *req, gfp_t gfp_flags)
 	if (dev->port_usb->is_fixed)
 		size = max_t(size_t, size, dev->port_usb->fixed_out_len);
 
-	DBG(dev, "%s: size: %d\n", __func__, size);
-	skb = alloc_skb(size + NET_IP_ALIGN, gfp_flags);
+	skb = alloc_skb(size + NET_IP_ALIGN + DMA_IP_ALIGN_PAD, gfp_flags);
 	if (skb == NULL) {
 		DBG(dev, "no rx skb\n");
 		goto enomem;
@@ -253,7 +256,7 @@ rx_submit(struct eth_dev *dev, struct usb_request *req, gfp_t gfp_flags)
 	 * but on at least one, checksumming fails otherwise.  Note:
 	 * RNDIS headers involve variable numbers of LE32 values.
 	 */
-	skb_reserve(skb, NET_IP_ALIGN);
+	skb_reserve(skb, NET_IP_ALIGN + DMA_IP_ALIGN_PAD);
 
 	req->buf = skb->data;
 	req->length = size;
@@ -806,6 +809,7 @@ static int eth_stop(struct net_device *net)
 {
 	struct eth_dev	*dev = netdev_priv(net);
 	unsigned long	flags;
+	int		result = 0;
 
 	VDBG(dev, "%s\n", __func__);
 	netif_stop_queue(net);
@@ -836,14 +840,23 @@ static int eth_stop(struct net_device *net)
 		 */
 		in = link->in_ep->desc;
 		out = link->out_ep->desc;
-		usb_ep_disable(link->in_ep);
-		usb_ep_disable(link->out_ep);
+		if (in) {
+			usb_ep_disable(link->in_ep);
+			link->in_ep->desc = NULL;
+		}
+		if (out) {
+			usb_ep_disable(link->out_ep);
+			link->out_ep->desc = NULL;
+		}
+
 		if (netif_carrier_ok(net)) {
 			DBG(dev, "host still using in/out endpoints\n");
-			link->in_ep->desc = in;
-			link->out_ep->desc = out;
-			usb_ep_enable(link->in_ep);
-			usb_ep_enable(link->out_ep);
+			result = usb_ep_enable(link->in_ep);
+			if (!result)
+				link->in_ep->desc = in;
+			result = usb_ep_enable(link->out_ep);
+			if (!result)
+				link->out_ep->desc = out;
 		}
 	}
 	spin_unlock_irqrestore(&dev->lock, flags);
@@ -1119,7 +1132,8 @@ void gether_disconnect(struct gether *link)
 	 * of all pending i/o.  then free the request objects
 	 * and forget about the endpoints.
 	 */
-	usb_ep_disable(link->in_ep);
+	if (link->in_ep->desc)
+		usb_ep_disable(link->in_ep);
 	spin_lock(&dev->req_lock);
 	while (!list_empty(&dev->tx_reqs)) {
 		req = container_of(dev->tx_reqs.next,
@@ -1136,7 +1150,8 @@ void gether_disconnect(struct gether *link)
 	link->in_ep->driver_data = NULL;
 	link->in_ep->desc = NULL;
 
-	usb_ep_disable(link->out_ep);
+	if (link->out_ep->desc)
+		usb_ep_disable(link->out_ep);
 	spin_lock(&dev->req_lock);
 	while (!list_empty(&dev->rx_reqs)) {
 		req = container_of(dev->rx_reqs.next,

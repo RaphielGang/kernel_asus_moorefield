@@ -1990,13 +1990,13 @@ u32 addrconf_rt_table(const struct net_device *dev, u32 default_table) {
 	struct inet6_dev *idev = in6_dev_get(dev);
 	u32 table;
 	int sysctl = idev->cnf.accept_ra_rt_table;
-	if (sysctl == 0) {
+
+	if (sysctl == 0)
 		table = default_table;
-	} else if (sysctl > 0) {
+	else if (sysctl > 0)
 		table = (u32) sysctl;
-	} else {
+	else
 		table = (unsigned) dev->ifindex + (-sysctl);
-	}
 	in6_dev_put(idev);
 	return table;
 }

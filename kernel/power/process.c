@@ -34,6 +34,7 @@ static int try_to_freeze_tasks(bool user_only)
 	unsigned int elapsed_msecs;
 	bool wakeup = false;
 	int sleep_usecs = USEC_PER_MSEC;
+	char *busy_wq_name = NULL;
 #ifdef CONFIG_PM_SLEEP
 	char suspend_abort[MAX_SUSPEND_ABORT_LEN];
 #endif
@@ -58,7 +59,7 @@ static int try_to_freeze_tasks(bool user_only)
 		read_unlock(&tasklist_lock);
 
 		if (!user_only) {
-			wq_busy = freeze_workqueues_busy();
+			wq_busy = freeze_workqueues_busy(&busy_wq_name);
 			todo += wq_busy;
 		}
 
@@ -96,10 +97,11 @@ static int try_to_freeze_tasks(bool user_only)
 		       elapsed_msecs / 1000, elapsed_msecs % 1000);
 	} else if (todo) {
 		printk("\n");
-		printk(KERN_ERR "Freezing of tasks failed after %d.%03d seconds"
-		       " (%d tasks refusing to freeze, wq_busy=%d):\n",
+		printk(KERN_ERR "Freezing of tasks %s after %d.%03d seconds "
+		       "(%d tasks refusing to freeze, wq_busy=%d, "
+		       "wq_name=%s):\n", wakeup ? "aborted" : "failed",
 		       elapsed_msecs / 1000, elapsed_msecs % 1000,
-		       todo - wq_busy, wq_busy);
+		       todo - wq_busy, wq_busy, wq_busy ? "" : busy_wq_name);
 
 		read_lock(&tasklist_lock);
 		do_each_thread(g, p) {

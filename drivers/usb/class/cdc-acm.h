@@ -118,6 +118,9 @@ struct acm {
 	unsigned int throttle_req:1;			/* throttle requested */
 	u8 bInterval;
 	struct usb_anchor delayed;			/* writes queued for a device about to be woken */
+
+	unsigned int bytes_rx, bytes_tx;		/* flow statistics */
+	unsigned int packets_rx, packets_tx;
 };
 
 #define CDC_DATA_INTERFACE_TYPE	0x0a
@@ -129,3 +132,6 @@ struct acm {
 #define NOT_A_MODEM			8
 #define NO_DATA_INTERFACE		16
 #define IGNORE_DEVICE			32
+/* CloverView Comneon Modem Device Info */
+#define CTP_MODEM_VID			0x1519
+#define CTP_MODEM_PID			0x0020

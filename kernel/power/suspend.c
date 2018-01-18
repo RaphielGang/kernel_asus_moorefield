@@ -26,12 +26,18 @@
 #include <linux/syscore_ops.h>
 #include <linux/ftrace.h>
 #include <linux/rtc.h>
+#include <linux/workqueue.h>
 #include <trace/events/power.h>
 #include <linux/wakeup_reason.h>
 
 #include "power.h"
 
+static void do_suspend_sync(struct work_struct *work);
+
 struct pm_sleep_state pm_states[PM_SUSPEND_MAX] = {
+#ifdef CONFIG_EARLYSUSPEND
+	[PM_SUSPEND_ON] = { .label = "on", },
+#endif
 	[PM_SUSPEND_FREEZE] = { .label = "freeze", .state = PM_SUSPEND_FREEZE },
 	[PM_SUSPEND_STANDBY] = { .label = "standby", },
 	[PM_SUSPEND_MEM] = { .label = "mem", },
@@ -43,6 +49,9 @@ static bool need_suspend_ops(suspend_state_t state)
 {
 	return !!(state > PM_SUSPEND_FREEZE);
 }
+
+static DECLARE_WORK(suspend_sync_work, do_suspend_sync);
+static DECLARE_COMPLETION(suspend_sync_complete);
 
 static DECLARE_WAIT_QUEUE_HEAD(suspend_freeze_wait_head);
 static bool suspend_freeze_wake;
@@ -63,6 +72,42 @@ void freeze_wake(void)
 	wake_up(&suspend_freeze_wait_head);
 }
 EXPORT_SYMBOL_GPL(freeze_wake);
+
+static void do_suspend_sync(struct work_struct *work)
+{
+	sys_sync();
+	complete(&suspend_sync_complete);
+}
+
+static bool check_sys_sync(void)
+{
+	while (!wait_for_completion_timeout(&suspend_sync_complete,
+		HZ / 5)) {
+		if (pm_wakeup_pending())
+			return false;
+		/* If sys_sync is doing, and no wakeup pending,
+		 * we can try in loop to wait sys_sync() finish.
+		 */
+	}
+
+	return true;
+}
+
+static bool suspend_sync(void)
+{
+	if (work_busy(&suspend_sync_work)) {
+		/* When last sys_sync() work is still running,
+		 * we need wait for it to be finished.
+		 */
+		if (!check_sys_sync())
+			return false;
+	}
+
+	INIT_COMPLETION(suspend_sync_complete);
+	schedule_work(&suspend_sync_work);
+
+	return check_sys_sync();
+}
 
 static bool valid_state(suspend_state_t state)
 {
@@ -348,7 +393,11 @@ static int enter_state(suspend_state_t state)
 		freeze_begin();
 
 	printk(KERN_INFO "PM: Syncing filesystems ... ");
-	sys_sync();
+	if (!suspend_sync()) {
+		printk(KERN_INFO "PM: Suspend aborted for filesystem syncing\n");
+		error = -EBUSY;
+		goto Unlock;
+	}
 	printk("done.\n");
 
 	pr_debug("PM: Preparing system for %s sleep\n", pm_states[state].label);

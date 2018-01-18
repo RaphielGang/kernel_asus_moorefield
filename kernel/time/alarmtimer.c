@@ -25,6 +25,8 @@
 #include <linux/posix-timers.h>
 #include <linux/workqueue.h>
 #include <linux/freezer.h>
+#include <linux/reboot.h>
+#include <linux/notifier.h>
 
 /**
  * struct alarm_base - Alarm timer bases
@@ -46,6 +48,14 @@ static ktime_t freezer_delta;
 static DEFINE_SPINLOCK(freezer_delta_lock);
 
 static struct wakeup_source *ws;
+
+static int alarm_reboot_callback(struct notifier_block *nfb,
+			unsigned long event, void *data);
+
+static struct notifier_block alarm_reboot_notifier_block = {
+	.notifier_call = alarm_reboot_callback,
+	.priority = 0,
+};
 
 #ifdef CONFIG_RTC_CLASS
 /* rtc timer and device for setting alarm wakeups at suspend */
@@ -270,11 +280,99 @@ static int alarmtimer_suspend(struct device *dev)
 		__pm_wakeup_event(ws, MSEC_PER_SEC);
 	return ret;
 }
+
+/**
+ * alarmtimer_resume - Resume time callback
+ * @dev: unused
+ *
+ * We just waked up, no need of rtc timer anymore,
+ * so we can cancel it.
+ */
+static int alarmtimer_resume(struct device *dev)
+{
+	struct rtc_device *rtc;
+
+	rtc = alarmtimer_get_rtcdev();
+	/* If we have no rtcdev, just return */
+	if (!rtc)
+		return 0;
+
+	/* cancel rtc timer if pending */
+	rtc_timer_cancel(rtc, &rtctimer);
+
+	return 0;
+}
+
+static void write_rtc_wakeup(void)
+{
+	struct rtc_time tm;
+	ktime_t now, delta;
+	unsigned long flags;
+	struct rtc_device *rtc;
+	struct timerqueue_node *next;
+	struct alarm_base *base = &alarm_bases[ALARM_REALTIME_OFF];
+	struct rtc_wkalrm alrm;
+	int rtc_alarm = 0;
+	int err;
+
+	rtc = alarmtimer_get_rtcdev();
+	/* If we have no rtcdev, just return */
+	if (!rtc)
+		return;
+
+	/* Find the soonest timer to expire*/
+
+	spin_lock_irqsave(&base->lock, flags);
+	next = timerqueue_getnext(&base->timerqueue);
+	spin_unlock_irqrestore(&base->lock, flags);
+
+	err = rtc_read_alarm(rtc, &alrm);
+	if (err == 0)
+		rtc_alarm = alrm.enabled;
+
+	if (!next && !rtc_alarm) {
+		/* no OFF alarm and no rtc alarm pending, cancel everything
+		 * else and disable RTC alarm.
+		 */
+		rtc_cancel_all_timers(rtc);
+		return;
+	}
+
+	if (next) {
+		delta = ktime_sub(next->expires, base->gettime());
+		if (delta.tv64 == 0)
+			return;
+
+		rtc_read_time(rtc, &tm);
+		now = rtc_tm_to_ktime(tm);
+		now = ktime_add(now, delta);
+	} else
+		/* alarm has been programmed through sysfs*/
+		now = rtc_tm_to_ktime(alrm.time);
+
+	/* Setup an rtc timer to fire that far in the future */
+	rtc_cancel_all_timers(rtc);
+
+	/* Set alarm */
+	rtc_timer_start(rtc, &rtctimer, now, ktime_set(0, 0));
+}
+
 #else
 static int alarmtimer_suspend(struct device *dev)
 {
 	return 0;
 }
+
+static int alarmtimer_resume(struct device *dev)
+{
+	return 0;
+}
+
+static void write_rtc_wakeup(void)
+{
+	return;
+}
+
 #endif
 
 static void alarmtimer_freezerset(ktime_t absexp, enum alarmtimer_type type)
@@ -444,6 +542,8 @@ static enum alarmtimer_type clock2alarm(clockid_t clockid)
 		return ALARM_REALTIME;
 	if (clockid == CLOCK_BOOTTIME_ALARM)
 		return ALARM_BOOTTIME;
+	if (clockid == CLOCK_REALTIME_ALARM_OFF)
+		return ALARM_REALTIME_OFF;
 	return -1;
 }
 
@@ -791,7 +891,15 @@ out:
 /* Suspend hook structures */
 static const struct dev_pm_ops alarmtimer_pm_ops = {
 	.suspend = alarmtimer_suspend,
+	.resume = alarmtimer_resume,
 };
+
+static int alarm_reboot_callback(struct notifier_block *nfb,
+				unsigned long event, void *data)
+{
+	write_rtc_wakeup();
+	return NOTIFY_OK;
+}
 
 static struct platform_driver alarmtimer_driver = {
 	.driver = {
@@ -825,12 +933,15 @@ static int __init alarmtimer_init(void)
 
 	posix_timers_register_clock(CLOCK_REALTIME_ALARM, &alarm_clock);
 	posix_timers_register_clock(CLOCK_BOOTTIME_ALARM, &alarm_clock);
+	posix_timers_register_clock(CLOCK_REALTIME_ALARM_OFF, &alarm_clock);
 
 	/* Initialize alarm bases */
 	alarm_bases[ALARM_REALTIME].base_clockid = CLOCK_REALTIME;
 	alarm_bases[ALARM_REALTIME].gettime = &ktime_get_real;
 	alarm_bases[ALARM_BOOTTIME].base_clockid = CLOCK_BOOTTIME;
 	alarm_bases[ALARM_BOOTTIME].gettime = &ktime_get_boottime;
+	alarm_bases[ALARM_REALTIME_OFF].base_clockid = CLOCK_REALTIME;
+	alarm_bases[ALARM_REALTIME_OFF].gettime = &ktime_get_real;
 	for (i = 0; i < ALARM_NUMTYPE; i++) {
 		timerqueue_init_head(&alarm_bases[i].timerqueue);
 		spin_lock_init(&alarm_bases[i].lock);
@@ -850,6 +961,9 @@ static int __init alarmtimer_init(void)
 		goto out_drv;
 	}
 	ws = wakeup_source_register("alarmtimer");
+
+	register_reboot_notifier(&alarm_reboot_notifier_block);
+
 	return 0;
 
 out_drv:

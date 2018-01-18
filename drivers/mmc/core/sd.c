@@ -13,6 +13,7 @@
 #include <linux/err.h>
 #include <linux/slab.h>
 #include <linux/stat.h>
+#include <linux/HWVersion.h>
 
 #include <linux/mmc/host.h>
 #include <linux/mmc/card.h>
@@ -57,6 +58,14 @@ static const unsigned int tacc_mant[] = {
 			__res |= resp[__off-1] << ((32 - __shft) % 32);	\
 		__res & __mask;						\
 	})
+
+int sd_power_off = 0;
+struct mmc_ios old_ios;
+EXPORT_SYMBOL(sd_power_off);
+extern void mmc_power_off(struct mmc_host *host);
+extern void mmc_power_up(struct mmc_host *host);
+extern void mmc_set_ios(struct mmc_host *host);
+extern int Read_PROJ_ID(void);
 
 /*
  * Given the decoded CSD structure, decode the raw CID to our CID structure.
@@ -215,7 +224,7 @@ static int mmc_decode_scr(struct mmc_card *card)
 static int mmc_read_ssr(struct mmc_card *card)
 {
 	unsigned int au, es, et, eo;
-	int err, i;
+	int err, i, max_au;
 	u32 *ssr;
 
 	if (!(card->csd.cmdclass & CCC_APP_SPEC)) {
@@ -239,12 +248,15 @@ static int mmc_read_ssr(struct mmc_card *card)
 	for (i = 0; i < 16; i++)
 		ssr[i] = be32_to_cpu(ssr[i]);
 
+	/* SD3.0 increases max AU size to 64MB (0xF) from 4MB (0x9) */
+	max_au = card->scr.sda_spec3 ? 0xF : 0x9;
+
 	/*
 	 * UNSTUFF_BITS only works with four u32s so we have to offset the
 	 * bitfield positions accordingly.
 	 */
 	au = UNSTUFF_BITS(ssr, 428 - 384, 4);
-	if (au > 0 && au <= 9) {
+	if (au > 0 && au <= max_au) {
 		card->ssr.au = 1 << (au + 4);
 		es = UNSTUFF_BITS(ssr, 408 - 384, 16);
 		et = UNSTUFF_BITS(ssr, 402 - 384, 6);
@@ -933,8 +945,10 @@ static int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
 	WARN_ON(!host->claimed);
 
 	err = mmc_sd_get_cid(host, ocr, cid, &rocr);
-	if (err)
+	if (err) {
+		pr_err("%s: mmc_sd_get_cid failed. err = %d\n", mmc_hostname(host), err);
 		return err;
+	}
 
 	if (oldcard) {
 		if (memcmp(cid, oldcard->raw_cid, sizeof(cid)) != 0)
@@ -958,8 +972,10 @@ static int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
 	 */
 	if (!mmc_host_is_spi(host)) {
 		err = mmc_send_relative_addr(host, &card->rca);
-		if (err)
+		if (err) {
+			pr_err("%s: mmc_send_relative_addr failed. err = %d\n", mmc_hostname(host), err);
 			return err;
+		}
 	}
 
 	if (!oldcard) {
@@ -975,19 +991,45 @@ static int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
 	 */
 	if (!mmc_host_is_spi(host)) {
 		err = mmc_select_card(card);
-		if (err)
+		if (err) {
+			pr_err("%s: mmc_select_card failed. err = %d\n", mmc_hostname(host), err);
 			return err;
+		}
 	}
 
 	err = mmc_sd_setup_card(host, card, oldcard != NULL);
-	if (err)
+	if (err) {
+		pr_err("%s: mmc_select_card failed. err = %d\n", mmc_hostname(host), err);
 		goto free_card;
+	}
+
+	if (!(rocr & SD_ROCR_S18A) && mmc_sd_card_uhs(card)) {
+		/*
+		 * SD card which has DDR50/SDR104 flag and noddr50 flag has
+		 * already in 1.8v IO voltage without a power loss
+		 */
+		err = __mmc_set_signal_voltage(host, MMC_SIGNAL_VOLTAGE_180);
+		if (err) {
+			pr_err("%s: swith to 1.8v for re-init failed\n",
+					mmc_hostname(host));
+			goto free_card;
+		}
+		rocr |= SD_ROCR_S18A;
+	}
+
+	if (mmc_card_noddr50(card)) {
+		card->sw_caps.sd3_bus_mode &= ~(SD_MODE_UHS_DDR50 |
+				SD_MODE_UHS_SDR104);
+		pr_info("%s: disable DDR50/SDR104\n", __func__);
+	}
 
 	/* Initialization sequence for UHS-I cards */
 	if (rocr & SD_ROCR_S18A) {
 		err = mmc_sd_init_uhs_card(card);
-		if (err)
+		if (err) {
+			pr_err("%s: mmc_sd_init_uhs_card failed. err = %d\n", mmc_hostname(host), err);
 			goto free_card;
+		}
 
 		/* Card is an ultra-high-speed card */
 		mmc_card_set_uhs(card);
@@ -998,9 +1040,10 @@ static int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
 		err = mmc_sd_switch_hs(card);
 		if (err > 0)
 			mmc_sd_go_highspeed(card);
-		else if (err)
+		else if (err) {
+			pr_err("%s: mmc_sd_switch_hs failed. err = %d\n", mmc_hostname(host), err);
 			goto free_card;
-
+		}
 		/*
 		 * Set bus speed.
 		 */
@@ -1012,8 +1055,10 @@ static int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
 		if ((host->caps & MMC_CAP_4_BIT_DATA) &&
 			(card->scr.bus_widths & SD_SCR_BUS_WIDTH_4)) {
 			err = mmc_app_set_bus_width(card, MMC_BUS_WIDTH_4);
-			if (err)
+			if (err) {
+				pr_err("%s: mmc_app_set_bus_width failed. err = %d\n", mmc_hostname(host), err);
 				goto free_card;
+			}
 
 			mmc_set_bus_width(host, MMC_BUS_WIDTH_4);
 		}
@@ -1106,7 +1151,7 @@ static int mmc_sd_suspend(struct mmc_host *host)
 
 	BUG_ON(!host);
 	BUG_ON(!host->card);
-
+	old_ios = host->ios;
 	mmc_claim_host(host);
 	if (!mmc_host_is_spi(host))
 		err = mmc_deselect_cards(host);
@@ -1114,6 +1159,49 @@ static int mmc_sd_suspend(struct mmc_host *host)
 	mmc_release_host(host);
 
 	return err;
+}
+
+void mmc_sd_asus_init(struct mmc_host *host)
+{
+	mmc_host_clk_hold(host);
+	host->ios.clock = old_ios.clock;
+	host->ios.vdd = old_ios.vdd;
+	host->ios.power_mode = old_ios.power_mode;
+	host->ios.bus_width = old_ios.bus_width;
+	host->ios.timing = old_ios.timing;
+	host->ios.signal_voltage = old_ios.signal_voltage;
+	mmc_set_ios(host);
+
+	mmc_delay(1);
+	mmc_host_clk_release(host);
+}
+
+bool is_sd_SanDisk(struct mmc_host *host)
+{
+	if(!host->card)
+		return false;
+
+	char *prod_name = host->card->cid.prod_name;
+	if(!strcmp(prod_name, "SL16G") || !strcmp(prod_name, "SL32G") || /*red gray card 20160510*/
+	   !strcmp(prod_name, "SL64G") || !strcmp(prod_name, "SL128") ||
+	   !strcmp(prod_name, "SP16G") || !strcmp(prod_name, "SP32G") || /*red black card 20160614*/
+	   !strcmp(prod_name, "SP64G") || !strcmp(prod_name, "SP128") ||
+	   !strcmp(prod_name, "SE16G") || !strcmp(prod_name, "SE32G") || /*red gold card 20160620*/
+	   !strcmp(prod_name, "SE64G") || !strcmp(prod_name, "SE128")) {
+		if(old_ios.timing == MMC_TIMING_UHS_DDR50)
+			return true;
+	}
+	return false;
+}
+EXPORT_SYMBOL(is_sd_SanDisk);
+
+void sd_power_reset(struct mmc_host *host)
+{
+	sd_power_off = 1;
+	mmc_power_off(host);
+	if(Read_PROJ_ID() == PROJ_ID_ZX550ML)
+		mmc_delay(50);
+	mmc_power_up(host);
 }
 
 /*
@@ -1125,31 +1213,50 @@ static int mmc_sd_suspend(struct mmc_host *host)
 static int mmc_sd_resume(struct mmc_host *host)
 {
 	int err;
-#ifdef CONFIG_MMC_PARANOID_SD_INIT
+//#ifdef CONFIG_MMC_PARANOID_SD_INIT
 	int retries;
-#endif
+//#endif
 
 	BUG_ON(!host);
 	BUG_ON(!host->card);
 
 	mmc_claim_host(host);
-#ifdef CONFIG_MMC_PARANOID_SD_INIT
+//#ifdef CONFIG_MMC_PARANOID_SD_INIT
 	retries = 5;
 	while (retries) {
-		err = mmc_sd_init_card(host, host->ocr, host->card);
+		if(is_sd_SanDisk(host) && (retries == 5) && (Read_PROJ_ID() == PROJ_ID_ZX550ML)) {
+			if (!mmc_host_is_spi(host) ) {
+				err = mmc_select_card(host->card);
+			}
+			if (err) {
+				pr_err("%s: mmc_select_card failed. err = %d\n", mmc_hostname(host), err);
+				sd_power_reset(host);
+				mdelay(5);
+				retries--;
+			} else {
+				pr_info("%s: is SanDisk SD card, use mmc_sd_asus_init\n", mmc_hostname(host));
+				mmc_sd_asus_init(host);
+				break;
+			}
+		} else {
+			err = mmc_sd_init_card(host, host->ocr, host->card);
 
-		if (err) {
-			printk(KERN_ERR "%s: Re-init card rc = %d (retries = %d)\n",
+			if (err) {
+				printk(KERN_ERR "%s: Re-init card rc = %d (retries = %d)\n",
 			       mmc_hostname(host), err, retries);
-			mdelay(5);
-			retries--;
-			continue;
+
+				pr_err("%s: resume failed. Powering off/up sd card again.\n", mmc_hostname(host));
+				sd_power_reset(host);
+				mdelay(5);
+				retries--;
+				continue;
+			}
+			break;
 		}
-		break;
 	}
-#else
-	err = mmc_sd_init_card(host, host->ocr, host->card);
-#endif
+//#else
+//	err = mmc_sd_init_card(host, host->ocr, host->card);
+//#endif
 	mmc_release_host(host);
 
 	return err;

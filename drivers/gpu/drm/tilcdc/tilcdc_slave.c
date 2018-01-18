@@ -142,7 +142,6 @@ struct slave_connector {
 static void slave_connector_destroy(struct drm_connector *connector)
 {
 	struct slave_connector *slave_connector = to_slave_connector(connector);
-	drm_sysfs_connector_remove(connector);
 	drm_connector_cleanup(connector);
 	kfree(slave_connector);
 }
@@ -323,6 +322,8 @@ static int slave_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "could not get i2c bus phandle\n");
 		goto fail;
 	}
+
+	mod->preferred_bpp = slave_info.bpp;
 
 	i2c_node = of_find_node_by_phandle(i2c_phandle);
 	if (!i2c_node) {

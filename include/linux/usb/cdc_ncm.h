@@ -45,9 +45,15 @@
 /* CDC NCM subclass 3.2.1 */
 #define USB_CDC_NCM_NDP16_LENGTH_MIN		0x10
 
+/*
+ * The memory request is 16768/33152 bytes (Moorefield) to low-level page
+ * allocator after the extra structure and padding are included so shrink
+ * the size here. The request becomes 15232/31680 bytes which is a relief
+ * to page/slab allocator.
+ */
 /* Maximum NTB length */
-#define	CDC_NCM_NTB_MAX_SIZE_TX			32768	/* bytes */
-#define	CDC_NCM_NTB_MAX_SIZE_RX			32768	/* bytes */
+#define	CDC_NCM_NTB_MAX_SIZE_TX			(16384 - (CDC_NCM_MIN_DATAGRAM_SIZE))	/* bytes */
+#define	CDC_NCM_NTB_MAX_SIZE_RX			(32768 - (CDC_NCM_MIN_DATAGRAM_SIZE))	/* bytes */
 
 /* Minimum value for MaxDatagramSize, ch. 6.2.9 */
 #define	CDC_NCM_MIN_DATAGRAM_SIZE		1514	/* bytes */
@@ -125,6 +131,13 @@ struct cdc_ncm_ctx {
 	u16 tx_seq;
 	u16 rx_seq;
 	u16 connected;
+
+	u8 *fragment;
+	u32 fragment_size;
+	u32 fragment_deleted;
+	u32 fragment_recombinated;
+
+	int device_flags;
 };
 
 extern u8 cdc_ncm_select_altsetting(struct usbnet *dev, struct usb_interface *intf);
